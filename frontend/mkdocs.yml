@@ -1,0 +1,8 @@
+site_name: "VDIP - Vehicle Damage Intelligence Platform"
+site_description: "VDIP - Vehicle Damage Intelligence Platform"
+
+nav:
+  - Introduction: index.md
+
+plugins:
+  - techdocs-core
