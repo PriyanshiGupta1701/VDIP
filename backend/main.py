@@ -589,7 +589,7 @@ class State(TypedDict):
     image_path: str
     output: Dict[str, Any]
 os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
-os.environ["GOOGLE_GEMINI_MODEL"] = os.getenv("GOOGLE_GEMINI_MODEL", "gemini-2.0-flash")
+os.environ["GOOGLE_GEMINI_MODEL"] = os.getenv("GOOGLE_GEMINI_MODEL", "gemini-3.8-flash")
  
  
 def _llm_text(content) -> str:
