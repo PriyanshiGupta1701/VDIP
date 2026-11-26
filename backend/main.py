@@ -592,8 +592,23 @@ os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
 os.environ["GOOGLE_GEMINI_MODEL"] = os.getenv("GOOGLE_GEMINI_MODEL", "gemini-2.0-flash")
  
  
+def _llm_text(content) -> str:
+    """Normalize LangChain message content (str or list of content blocks) to plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type", "text") == "text":
+                parts.append(block.get("text", ""))
+        return "".join(parts)
+    return str(content or "")
+
+
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.0-flash",
+    model=os.environ["GOOGLE_GEMINI_MODEL"],
     google_api_key=os.environ["GOOGLE_API_KEY"]
 )
 def scrape_prices_from_links(links):
@@ -646,13 +661,14 @@ $min_price - $max_price
 Do not add explanations.
 """)
     ]
-    return llm.invoke(messages).content.strip()
+    return _llm_text(llm.invoke(messages).content).strip()
  
 def price_estimator_node(state: State):
     output = state.get("output", {})
     for part, details in output.items():
         if details.get("replacement_links"):
-            prices = scrape_prices_from_links(details["replacement_links"])
+            # Prefer prices returned by SerpAPI; fall back to scraping the links
+            prices = details.get("shopping_prices") or scrape_prices_from_links(details["replacement_links"])
             details["estimated_price_range"] = estimate_price_range_with_gemini(prices)
         else:
             details["estimated_price_range"] = ""
@@ -706,7 +722,7 @@ Always:
                 }
             ])
         ]
-    return llm.invoke(messages).content
+    return _llm_text(llm.invoke(messages).content)
  
 # =========================
 # TOOL: GENERATE SEARCH QUERY
@@ -792,34 +808,60 @@ Begin now.
         ]
  
         result = llm.invoke(messages)
-        return result.content.strip().replace("Query:", "").strip()
+        return _llm_text(result.content).strip().replace("Query:", "").strip()
  
     except Exception as e:
         return f"⚠️ Error generating search query: {e}"
 # =========================
 # TOOL: SEARCH GOOGLE SHOPPING (SERPAPI)
 # =========================
-def search_google_shopping(query: str, api_key: str, cse_id: str, max_results=5):
-    url = "https://www.googleapis.com/customsearch/v1"
- 
-    # No site filtering applied
-    full_query = query  # Use the query as-is
- 
+def search_google_shopping(query: str, api_key: str = None, max_results: int = 5):
+    """
+    Search Google Shopping through SerpAPI.
+    Returns (links, prices): product links and numeric prices (floats) of the top results.
+    Returns ([], []) on any failure so errors never end up in the report.
+    """
+    api_key = api_key or os.getenv("SERPAPI_API_KEY")
+    if not api_key:
+        print("⚠️ SERPAPI_API_KEY is not set; skipping part search.")
+        return [], []
+
+    # Gemini returns queries like: "rear" + "bumper" + "auto"  -> plain keywords for Shopping
+    clean_query = re.sub(r'["+*`]', " ", query or "")
+    clean_query = re.sub(r"\s+", " ", clean_query).strip()
+    if not clean_query:
+        return [], []
+
     params = {
-        "key": api_key,
-        "cx": cse_id,
-        "q": full_query,
-        "num": max_results
+        "engine": "google_shopping",
+        "q": clean_query,
+        "api_key": api_key,
+        "gl": os.getenv("SERPAPI_GL", "us"),
+        "hl": "en",
     }
- 
-    response = requests.get(url, params=params)
-    if response.status_code == 200:
+    try:
+        response = requests.get("https://serpapi.com/search.json", params=params, timeout=30)
         data = response.json()
-        links = [item["link"] for item in data.get("items", [])]
-        return links if links else ["No results found."]
-    else:
-        return [f"⚠️ Error {response.status_code}: {response.text}"]
- 
+    except Exception as e:
+        print(f"⚠️ SerpAPI request failed: {e}")
+        return [], []
+
+    if response.status_code != 200 or data.get("error"):
+        print(f"⚠️ SerpAPI error ({response.status_code}): {str(data.get('error', data))[:300]}")
+        return [], []
+
+    links, prices = [], []
+    for item in data.get("shopping_results", []):
+        link = item.get("link") or item.get("product_link")
+        if not link or link in links:
+            continue
+        links.append(link.replace(" ", "%20"))  # keep links clickable in Sheets
+        if isinstance(item.get("extracted_price"), (int, float)):
+            prices.append(float(item["extracted_price"]))
+        if len(links) >= max_results:
+            break
+    return links, prices
+
 # =========================
 # TOOL: HANDLE DAMAGE RESPONSE
 # =========================
@@ -841,6 +883,7 @@ def handle_damage_response(response_json_json: str, image_path: str) -> dict:
             "decision": decision or "unknown",
             "gemini_query": None,
             "replacement_links": [],
+            "shopping_prices": [],
             "repair_guide": None,
         }
  
@@ -851,7 +894,7 @@ def handle_damage_response(response_json_json: str, image_path: str) -> dict:
             raw_query = generate_search_query_from_damage(full_description, image_path)
             query = next((line.strip("* ").strip() for line in raw_query.split("\n") if line.strip()), raw_query)
             entry["gemini_query"] = query
-            entry["replacement_links"] = search_google_shopping(query, os.getenv("GOOGLE_SEARCH_API_KEY"), os.getenv("GOOGLE_CSE_ID"))
+            entry["replacement_links"], entry["shopping_prices"] = search_google_shopping(query)
  
         output_dict[dtype] = entry
  
@@ -914,14 +957,18 @@ def _label_from_url(url):
     except Exception:
         return url
  
-def _make_hyperlink(url):
-    label = _label_from_url(url).replace('"', '')
+def _make_hyperlink(url, label=None):
+    label = (label or _label_from_url(url)).replace('"', '')
     return f'HYPERLINK("{url}","{label}")'
  
 def _join_links_formula(links):
     if not links:
         return ""
-    parts = [_make_hyperlink(u) for u in links]
+    # Google Shopping links all look like "search"; number them instead
+    parts = [
+        _make_hyperlink(u, f"Product {i}" if "google.com/search" in u else None)
+        for i, u in enumerate(links, 1)
+    ]
     return '=' + ' & CHAR(10) & '.join(parts) if len(parts) > 1 else '=' + parts[0]
 
 def sanitize_title(title: str) -> str:
@@ -1130,12 +1177,12 @@ graph.add_edge("price_estimator_node", "write_to_sheets_node")
 graph.add_edge("write_to_sheets_node", END)
 
 
-graph_image_path = "graph_visualization.png"
+# graph_image_path = "graph_visualization.png"
 compiled_graph = graph.compile()
  
-with open(graph_image_path, "wb") as f:
-    f.write(compiled_graph.get_graph().draw_mermaid_png())
-print(f"✅ Graph visualization saved to {graph_image_path}")
+# with open(graph_image_path, "wb") as f:
+#     f.write(compiled_graph.get_graph().draw_mermaid_png())
+# print(f"✅ Graph visualization saved to {graph_image_path}")
 
 import json
 
@@ -1212,7 +1259,7 @@ async def send_email_endpoint(email: str = Body(..., embed=True)):
         msg.attach(MIMEText(body, "plain"))
 
         # Send via SMTP
-        with smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT) as server:
+        with smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT, timeout=30) as server:
             server.starttls()
             server.login(EMAIL_SENDER, EMAIL_PASSWORD)
             server.sendmail(EMAIL_SENDER, [email], msg.as_string())
@@ -1220,7 +1267,9 @@ async def send_email_endpoint(email: str = Body(..., embed=True)):
         return {"message": f"Report sent to {email}"}
 
     except Exception as e:
-        return {"error": f"Failed to send email: {str(e)}"}
+        # Log the real reason and return a proper error status so the UI doesn't report success
+        print(f"❌ Email failed: {type(e).__name__}: {e}")
+        return JSONResponse(status_code=500, content={"error": f"Failed to send email: {str(e)}"})
 
 
  
@@ -1341,5 +1390,3 @@ def healthcheck():
 if __name__ == "__main__":
     # Local development server: http://127.0.0.1:8000
     uvicorn.run(app, host="127.0.0.1", port=8000)
-
-
